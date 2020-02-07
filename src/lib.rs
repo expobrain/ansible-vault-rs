@@ -5,6 +5,12 @@
 //! It detects incorrect vault secrets and incorrectly formatted vaults,
 //! and yields the appropriate errors.
 
+use aes_ctr::stream_cipher::generic_array::GenericArray;
+use aes_ctr::stream_cipher::{NewStreamCipher, SyncStreamCipher};
+use block_padding::{Padding, Pkcs7};
+use rand::{thread_rng, Rng};
+use std::io::BufRead;
+
 /// The error type for decrypting Ansible vaults.
 ///
 /// Errors either originate from failing I/O operations, or from
@@ -114,13 +120,47 @@ fn verify_vault(key: &[u8], ciphertext: &[u8], crypted_hmac: &[u8]) -> Result<bo
     Ok(hmac.result().code().as_slice().eq(crypted_hmac)) // Constant time equivalence is not required for this use case.
 }
 
+/// Encrypts a stream into and ansible vault usign a given key
+///
+/// When succesful, yields the text as a byte buffer.
+pub fn write_vault(input: &[u8], key: &str) -> Result<Vec<u8>> {
+    // Generate salt
+    let salt = thread_rng().gen_iter().take(32).collect::<Vec<u8>>();
+
+    // Derive keys
+    let key_length = 32;
+    let aes_block_size = 128 / 8;
+    let mut hmac_buffer = vec![0; 2 * key_length + aes_block_size];
+
+    pbkdf2::pbkdf2::<hmac::Hmac<sha2::Sha256>>(key.as_bytes(), &salt, 10000, &mut hmac_buffer);
+
+    let iv = &hmac_buffer[(key_length * 2)..(key_length * 2) + aes_block_size];
+    // let key1 = &hmac_buffer[0..key_length];
+    let key1 = &hmac_buffer[0..aes_block_size];
+    let key2 = &hmac_buffer[aes_block_size..(key_length * 2)];
+
+    // Key mjst be padded as per specifications http://tools.ietf.org/html/rfc5652#section-6.3
+    let mut key_padded = key.as_bytes().to_vec();
+    let padding_value = (key_padded.len() % aes_block_size) as u8;
+    let key_padded_size = (key_padded.len() + key_length - 1) / key_length * key_length;
+
+    key_padded.resize_with(key_padded_size, || padding_value);
+
+    let mut ciphertext = Vec::from(input);
+    let mut cipher = aes_ctr::Aes256Ctr::new(
+        GenericArray::from_slice(key_padded.as_slice()),
+        GenericArray::from_slice(&key1),
+    );
+
+    cipher.apply_keystream(&mut ciphertext);
+
+    Ok(ciphertext.to_vec())
+}
+
 /// Decrypt an ansible vault stream using a key.
 ///
 /// When succesful, yields a plaintext byte buffer.
 pub fn read_vault<T: std::io::Read>(input: T, key: &str) -> Result<Vec<u8>> {
-    use block_padding::{Padding, Pkcs7};
-    use std::io::BufRead;
-
     let mut lines = std::io::BufReader::new(input).lines();
     let first: String = lines.next().ok_or(Error::NotAVault)??;
 
@@ -147,7 +187,6 @@ pub fn read_vault<T: std::io::Read>(input: T, key: &str) -> Result<Vec<u8>> {
         return Err(Error::IncorrectSecret);
     }
 
-    use aes_ctr::stream_cipher::{NewStreamCipher, SyncStreamCipher};
     let mut cipher = aes_ctr::Aes256Ctr::new_var(key1, iv).map_err(|_err| Error::InvalidFormat)?;
 
     cipher.apply_keystream(&mut ciphertext);
@@ -169,22 +208,38 @@ pub fn read_vault_from_file(path: &std::path::Path, key: &str) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::str::FromStr;
+
     fn lipsum_path() -> std::path::PathBuf {
-        use std::str::FromStr;
         std::path::PathBuf::from_str("./test/lipsum.vault").unwrap()
     }
 
-    #[test]
-    fn wrong_password() {
-        let result = crate::read_vault_from_file(&lipsum_path(), "not shibboleet").unwrap_err();
-        std::assert_eq!(result, crate::Error::IncorrectSecret);
+    fn lipsum_txt_path() -> std::path::PathBuf {
+        std::path::PathBuf::from_str("./test/lipsum.txt").unwrap()
     }
 
+    // #[test]
+    // fn wrong_password() {
+    //     let result = crate::read_vault_from_file(&lipsum_path(), "not shibboleet").unwrap_err();
+    //     std::assert_eq!(result, crate::Error::IncorrectSecret);
+    // }
+
+    // #[test]
+    // fn read_to_string() {
+    //     let buf = crate::read_vault_from_file(&lipsum_path(), "shibboleet").unwrap();
+    //     let lipsum = std::string::String::from_utf8(buf).unwrap();
+    //     let reference = std::fs::read_to_string("./test/lipsum.txt").unwrap();
+    //     std::assert_eq!(lipsum, reference);
+    // }
+
     #[test]
-    fn contents() {
-        let buf = crate::read_vault_from_file(&lipsum_path(), "shibboleet").unwrap();
-        let lipsum = std::string::String::from_utf8(buf).unwrap();
-        let reference = std::fs::read_to_string("./test/lipsum.txt").unwrap();
-        std::assert_eq!(lipsum, reference);
+    fn write_from_string() {
+        let lipsum = fs::read_to_string(&lipsum_txt_path()).unwrap();
+
+        let encrypted = crate::write_vault(lipsum.as_bytes(), "shibboleet").unwrap();
+        let decrypted = crate::read_vault(encrypted.as_slice(), "shibboleet").unwrap();
+
+        std::assert_eq!(lipsum.as_bytes().to_vec(), decrypted);
     }
 }
